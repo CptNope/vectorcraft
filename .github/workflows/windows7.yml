@@ -6,20 +6,8 @@
 name: Windows 7 x64 compatibility
 
 on:
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "apps/vectorcraft/Cargo.toml"
-      - "apps/vectorcraft/src/printing.rs"
-      - "apps/vectorcraft/src/printing/**"
-      - "crates/ui-egui/src/print.rs"
-      - "crates/ui-egui/src/tests_printps.rs"
-      - "packaging/windows/windows7.ps1"
-      - ".github/workflows/windows7.yml"
-  schedule:
-    - cron: "23 5 * * 1" # weekly
   workflow_dispatch:
+
 
 permissions:
   contents: read
