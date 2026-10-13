@@ -1,0 +1,91 @@
+name: Deploy VectorCraft PWA to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/deploy-pwa.yml"
+      - "apps/**"
+      - "crates/**"
+      - "assets/**"
+      - "pwa/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "README-PWA.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vectorcraft-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out fork source
+        uses: actions/checkout@v4
+
+      - name: Check out official optional web fonts
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/craft-fonts
+          ref: 3d9ab3a132ed0eff457e424226a435a901da30d3
+          path: craft-fonts
+
+      - name: Install Rust WASM target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: vectorcraft-web-pwa
+
+      - name: Install Trunk
+        env:
+          TRUNK_VERSION: "0.21.14"
+        run: |
+          curl -fL --retry 3 --retry-delay 2 \
+            "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            -o "$RUNNER_TEMP/trunk.tar.gz"
+          mkdir -p "$HOME/.cargo/bin"
+          tar -xzf "$RUNNER_TEMP/trunk.tar.gz" -C "$HOME/.cargo/bin" trunk
+          trunk --version
+
+      - name: Build fork's VectorCraft WASM editor
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: |
+          cd apps/vectorcraft-web
+          trunk build --release
+
+      - name: Prepare PWA and preserve attribution
+        run: python3 pwa/prepare_site.py dist/web
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload static application
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
