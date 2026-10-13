@@ -1,16 +1,7 @@
 name: Desktop printing
 on:
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "apps/vectorcraft/Cargo.toml"
-      - "apps/vectorcraft/src/printing.rs"
-      - "apps/vectorcraft/src/printing/**"
-      - "crates/ui-egui/src/print.rs"
-      - "crates/ui-egui/src/tests_printps.rs"
-      - ".github/workflows/print.yml"
   workflow_dispatch:
+
 permissions:
   contents: read
 env:
