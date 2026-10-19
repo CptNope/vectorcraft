@@ -178,6 +178,10 @@ impl Buttons {
 }
 
 fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
+    if ctx.content_rect().width() < 760.0 {
+        show_mobile(app, ctx);
+        return;
+    }
     let Some(mut d) = app.ui.dialog.clone() else { return };
     sync(app, &mut d);
     let t = Tokens::get(ctx);
@@ -204,6 +208,133 @@ fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
         });
     });
     b.finish(app, ctx, d);
+}
+
+/// The two-column desktop dialog is wider than a phone screen. Render the same document
+/// fields in one scrollable column, with actions outside the scroll area so Create/Close
+/// stay reachable even when the virtual keyboard is open or the screen is short.
+fn show_mobile(app: &mut VectorcraftApp, ctx: &egui::Context) {
+    let Some(mut d) = app.ui.dialog.clone() else { return };
+    sync(app, &mut d);
+    let view = ctx.content_rect();
+    // The dialog's surrounding frame contributes another 20 points of horizontal padding.
+    let width = (view.width() - 40.0).clamp(200.0, 410.0);
+    let field_width = (width - 24.0).clamp(130.0, 280.0);
+    let scroll_height = (view.height() - 146.0).max(120.0);
+    let t = Tokens::get(ctx);
+    let mut buttons = Buttons::default();
+
+    window(ctx, KIND, 0, |ui| {
+        egui::Frame::NONE.inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+            ui.set_width(width);
+            ui.label(egui::RichText::new(tl!("New Document")).font(theme::semibold(16.0)).color(t.text));
+            ui.add_space(5.0);
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("new-document-phone")
+                .max_height(scroll_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(width - 10.0);
+                    ui.add_space(7.0);
+
+                    ui.label(tl!("Category"));
+                    let category = d.str("category");
+                    let categories: Vec<&str> = newdoc::category_names().collect();
+                    egui::ComboBox::from_id_salt("newdoc-mobile-category")
+                        .selected_text(category.clone())
+                        .width(field_width)
+                        .show_ui(ui, |ui| {
+                            for name in &categories {
+                                if ui.selectable_label(category == *name, tl!(*name)).clicked() {
+                                    d.fields.insert("category".into(), json!(name));
+                                    if let Some(first) =
+                                        newdoc::category(&app.session, name).and_then(|v| v.into_iter().next())
+                                    {
+                                        apply(&mut d, &first);
+                                    }
+                                }
+                            }
+                        });
+                    ui.add_space(7.0);
+
+                    ui.label(tl!("Preset"));
+                    let presets = newdoc::category(&app.session, &d.str("category")).unwrap_or_default();
+                    let selected = d.str("preset");
+                    egui::ComboBox::from_id_salt("newdoc-mobile-preset")
+                        .selected_text(if selected.is_empty() { tl!("Custom") } else { preset_name(&selected) })
+                        .width(field_width)
+                        .show_ui(ui, |ui| {
+                            for preset in &presets {
+                                if ui.selectable_label(selected == preset.name, preset_name(&preset.name)).clicked() {
+                                    apply(&mut d, preset);
+                                }
+                            }
+                        });
+                    ui.add_space(7.0);
+
+                    ui.label(tl!("Name"));
+                    form::text(ui, &mut d, "name", field_width);
+                    ui.add_space(7.0);
+                    let units = unit(&d);
+                    ui.label(tl!("Width"));
+                    form::length(ui, &mut d, "width", units, field_width);
+                    ui.add_space(5.0);
+                    ui.label(tl!("Height"));
+                    form::length(ui, &mut d, "height", units, field_width);
+                    ui.add_space(5.0);
+                    ui.label(tl!("Units"));
+                    units_dropdown(ui, &mut d, field_width);
+                    ui.add_space(5.0);
+                    ui.label(tl!("Orientation"));
+                    orientation(ui, &mut d);
+                    ui.add_space(5.0);
+                    ui.label(tl!("Artboards"));
+                    artboards(ui, &mut d, 100.0);
+                    ui.add_space(7.0);
+                    ui.label(tl!("Background Contents"));
+                    background(ui, &mut d, (field_width - 36.0).max(104.0));
+                    ui.add_space(8.0);
+                    ui.label(tl!("Bleed"));
+                    let bleed_field = ((width - 120.0) / 4.0).clamp(35.0, 58.0);
+                    form::bleed(ui, &mut d, unit(&d), bleed_field);
+                    ui.add_space(8.0);
+
+                    let mut advanced_open = d.bool("advanced");
+                    if ui.checkbox(&mut advanced_open, tl!("Advanced Options")).changed() {
+                        d.fields.insert("advanced".into(), json!(advanced_open));
+                    }
+                    if advanced_open {
+                        let colors: Vec<(Value, String)> =
+                            COLOR_MODES.iter().map(|(v, label)| (json!(v), label.to_string())).collect();
+                        let effects: Vec<(Value, String)> =
+                            RASTER_PPI.iter().map(|(v, label)| (json!(v), label.to_string())).collect();
+                        let previews: Vec<(Value, String)> = PreviewMode::ALL
+                            .iter()
+                            .map(|mode| (json!(mode.id()), form::humanize(mode.id()).trim_end_matches(':').to_string()))
+                            .collect();
+                        for (key, label, values) in [
+                            ("colorMode", tl!("Color Mode"), &colors),
+                            ("rasterEffectsPpi", tl!("Raster Effects"), &effects),
+                            ("previewMode", tl!("Preview Mode"), &previews),
+                        ] {
+                            ui.label(label);
+                            choice(ui, &mut d, key, values, field_width);
+                            ui.add_space(4.0);
+                        }
+                    }
+                    ui.add_space(8.0);
+                });
+            ui.add_space(5.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                buttons.close |= widgets::secondary_button(ui, tl!("Close")).clicked();
+                ui.add_space(8.0);
+                buttons.create |= widgets::primary_button(ui, tl!("Create")).clicked();
+            });
+        });
+    });
+    buttons.finish(app, ctx, d);
 }
 
 /// The category tabs and the chosen category's preset cards: a click chooses one, a double-click
@@ -491,6 +622,10 @@ fn advanced(ui: &mut egui::Ui, d: &mut Dialog, label: f32, field: f32) {
 
 /// More Settings: the classic form of the same fields.
 fn show_more(app: &mut VectorcraftApp, ctx: &egui::Context) {
+    if ctx.content_rect().width() < 760.0 {
+        show_mobile(app, ctx);
+        return;
+    }
     let Some(mut d) = app.ui.dialog.clone() else { return };
     sync(app, &mut d);
     let t = Tokens::get(ctx);
