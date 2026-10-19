@@ -157,6 +157,42 @@ fn a_linked_photoshop_document_places_and_updates() {
     assert!(near(centre_colour(&s.doc().unwrap().doc), BLUE));
 }
 
+/// An uncompressed 24-bit `w`×`h` Targa file of one color.
+fn targa(w: u16, h: u16, rgb: [u8; 3]) -> Vec<u8> {
+    let mut f = vec![0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    f.extend(w.to_le_bytes());
+    f.extend(h.to_le_bytes());
+    f.extend([24, 0]);
+    let [r, g, b] = rgb;
+    f.extend(std::iter::repeat_n([b, g, r], usize::from(w) * usize::from(h)).flatten());
+    f
+}
+
+/// A Targa file placed linked shows its pixels and updates when it changes, and a link can be
+/// relinked to one.
+#[test]
+fn a_linked_targa_file_places_updates_and_relinks() {
+    let dir = Folder::new("tga");
+    let pic = dir.file("art/photo.tga");
+    write(&pic, &targa(600, 300, RED));
+    let mut s = session();
+    let id = place(&mut s, &pic);
+    assert_eq!(image(&s, id).link.unwrap().path, pic);
+    assert!(near(centre_colour(&s.doc().unwrap().doc), RED));
+    write(&pic, &targa(400, 400, BLUE));
+    assert_eq!(s.execute("links.update", &json!({})).unwrap(), json!({"updated": [id.0], "missing": []}));
+    let im = image(&s, id);
+    assert_eq!((im.width, im.height), (400, 400));
+    assert!(near(centre_colour(&s.doc().unwrap().doc), BLUE));
+    let other = dir.file("other/red.vst");
+    write(&other, &targa(300, 100, RED));
+    let r = s.execute("links.relink", &json!({"ids": [id.0], "path": other})).unwrap();
+    assert_eq!(r, json!({"relinked": [id.0], "notFound": []}));
+    let im = image(&s, id);
+    assert_eq!((im.width, im.height, im.link.unwrap().path), (300, 100, other));
+    assert!(near(centre_colour(&s.doc().unwrap().doc), RED));
+}
+
 #[test]
 fn the_relative_path_finds_the_file_after_the_folder_moves() {
     let a = Folder::new("move-a");
@@ -255,6 +291,56 @@ fn a_modified_link_follows_the_update_links_preference() {
     assert_eq!((r["modifiedLinks"].clone(), r["updatedLinks"][0]["ids"].clone()), (json!([]), json!([id.0])), "{r}");
     assert!(near(centre_colour(&s.doc().unwrap().doc), BLUE));
     assert!(s.doc().unwrap().history.undo.is_empty(), "opening is not an undo step");
+}
+
+/// The half of opening that the desktop app runs on a thread of its own (`read_for_open`) reads
+/// the linked files and lays out the type. The half left for the UI thread (`open_read`) reads no
+/// file: with a linked file moved away in between, it opens the document that `document.open` opens.
+#[test]
+fn a_file_read_for_opening_has_its_links_read_and_its_type_laid_out() {
+    let dir = Folder::new("read-for-open");
+    let tif = dir.file("art/photo.tif");
+    let mut tiff = vec![];
+    image::RgbImage::from_pixel(600, 300, image::Rgb(RED)).write_to(&mut std::io::Cursor::new(&mut tiff), image::ImageFormat::Tiff).unwrap();
+    write(&tif, &tiff);
+    let (gone, changed) = (dir.file("gone.png"), dir.file("changed.png"));
+    write(&gone, &png(300, 100, BLUE));
+    write(&changed, &png(300, 100, BLUE));
+    let mut s = session();
+    let photo = place(&mut s, &tif);
+    place(&mut s, &gone);
+    place(&mut s, &changed);
+    let area = json!({"width": 150, "height": 20, "fit": "autoHeight"});
+    let r = s.execute("text.create", &json!({"x": 20, "y": 40, "text": "Linked files and type. ".repeat(12), "area": area})).unwrap();
+    let text = NodeId(r["id"].as_u64().unwrap());
+    s.execute("text.areaOptions", &json!({"ids": [text.0], "columns": 2})).unwrap();
+    let doc_path = dir.file("poster.vectorcraft");
+    save(&mut s, &doc_path);
+    std::fs::remove_file(&gone).unwrap();
+    write(&changed, &png(200, 200, RED));
+    let bytes = std::fs::read(&doc_path).unwrap();
+    let away = dir.file("away.tif");
+    for update in ["askWhenModified", "automatically"] {
+        let mut at_once = session();
+        at_once.execute("prefs.set", &json!({"key": "updateLinks", "value": update})).unwrap();
+        let expected = open(&mut at_once, &doc_path);
+        let rows = if update == "automatically" { &expected["updatedLinks"] } else { &expected["modifiedLinks"] };
+        assert!(expected["missingLinks"][0]["name"] == "gone.png" && rows[0]["name"] == "changed.png", "{update}: {expected}");
+        let file = cmd::fileio::read_for_open(&doc_path, &bytes, Some(doc_path.clone()), &Value::Null, update == "automatically").unwrap();
+        let doc = file.document();
+        let NodeKind::Image(im) = &doc.node(photo).unwrap().kind else { panic!("not an image") };
+        assert!(!doc.images[&im.key].is_proxy(), "{update}: the TIFF is read, not the preview saved for it");
+        let NodeKind::Text(t) = &doc.node(text).unwrap().kind else { panic!("not type") };
+        assert!(t.cached_bounds.is_some(), "{update}: the type is laid out");
+        std::fs::rename(&tif, &away).unwrap();
+        let mut opened = session();
+        let r = cmd::fileio::open_read(&mut opened, file).unwrap();
+        std::fs::rename(&away, &tif).unwrap();
+        assert_eq!(r, expected, "{update}");
+        let (a, b) = (at_once.doc().unwrap(), opened.doc().unwrap());
+        assert!(*b.doc == *a.doc, "{update}: the same document");
+        assert!(b.history.undo.is_empty() && !b.is_dirty(), "{update}");
+    }
 }
 
 #[test]

@@ -27,12 +27,20 @@ pub struct GestureTool {
     began: bool,
     /// Pencil/Paintbrush continuing a selected open path: (path, continue from its start).
     extend: Option<(NodeId, bool)>,
+    /// Pencil/Paintbrush starting on a selected path away from its ends: (path, Edit Selected
+    /// Paths' distance in points); the stroke redraws the section it ends on (#2850).
+    redraw: Option<(NodeId, f64)>,
     /// Fit tolerance in points (Pencil/Paintbrush/Smooth "Fidelity").
     pub fidelity: f64,
     /// Brush / eraser diameter in points.
     pub size: f64,
     /// Fill new pencil/brush strokes.
     pub fill: bool,
+    /// "Keep selected": select the path a Pencil, Paintbrush or Blob Brush stroke draws, continues
+    /// or merges into (on for the Pencil and Paintbrush, off for the Blob Brush).
+    pub keep_selected: bool,
+    /// "Merge only with selection": a Blob Brush stroke merges only with selected paths.
+    pub merge_only_selection: bool,
     /// "Edit selected paths within N pixels".
     pub edit_within: f64,
     /// "Close paths when ends are within N pixels".
@@ -61,9 +69,12 @@ impl GestureTool {
             active: false,
             began: false,
             extend: None,
+            redraw: None,
             fidelity,
             size: 10.0,
             fill: false,
+            keep_selected: id != "blobBrush",
+            merge_only_selection: false,
             edit_within: 12.0,
             close_within: 15.0,
             snap: DrawSnap::default(),
@@ -136,6 +147,18 @@ impl GestureTool {
         None
     }
 
+    /// The selected path whose outline is near `p` (Edit Selected Paths, off at 0 pixels).
+    fn find_redraw(&self, cx: &ToolContext, p: Point) -> Option<(NodeId, f64)> {
+        let tol = cx.tol(self.edit_within);
+        if self.edit_within <= 0.0 || !tol.is_finite() {
+            return None;
+        }
+        cx.selection.objects.iter().find_map(|id| {
+            let pd = cx.doc.node(*id).and_then(|n| n.path_data()).filter(|_| cx.doc.is_editable(*id))?;
+            pd.nearest(p).filter(|n| n.4 <= tol).map(|_| (*id, tol))
+        })
+    }
+
     /// Parameters of `path.freehand` for the current stroke.
     pub fn freehand_params(&self, closed: bool) -> Value {
         let mut v = json!({
@@ -144,9 +167,12 @@ impl GestureTool {
             "closed": closed,
             "style": if self.id == "paintbrush" { "brush" } else { "pencil" },
             "fill": self.fill,
+            "keepSelected": self.keep_selected,
         });
         if let Some((id, start)) = self.extend {
             v["extend"] = json!({"id": id.0, "end": if start { "start" } else { "end" }});
+        } else if let Some((id, within)) = self.redraw {
+            v["redraw"] = json!({"id": id.0, "within": within});
         }
         v
     }
@@ -164,7 +190,15 @@ impl GestureTool {
                 let closed = m.alt || (self.extend.is_none() && near);
                 vec![Action::Preview("path.freehand".into(), self.freehand_params(closed)), Action::Commit]
             }
-            "blobBrush" => vec![Action::Exec("path.blob".into(), json!({"points": points_json(pts), "size": self.size}))],
+            "blobBrush" => vec![Action::Exec(
+                "path.blob".into(),
+                json!({
+                    "points": points_json(pts),
+                    "size": self.size,
+                    "keepSelected": self.keep_selected,
+                    "mergeOnlySelection": self.merge_only_selection
+                }),
+            )],
             "eraser" => vec![Action::Exec("path.eraseRegion".into(), json!({"points": points_json(pts), "size": self.size}))],
             "knife" if pts.len() >= 2 => vec![Action::Exec("path.knife".into(), json!({"points": points_json(pts)}))],
             "smooth" if has_sel && pts.len() >= 2 => {
@@ -195,8 +229,9 @@ impl Tool for GestureTool {
                 self.active = true;
                 self.began = false;
                 self.extend = if self.draws_path() { self.find_extend(cx, p) } else { None };
-                // A path continued starts at its end; a new one where it snaps.
-                let start = if self.snaps() && self.extend.is_none() { self.snap.press(cx, p, &[], None) } else { p };
+                self.redraw = if self.draws_path() && self.extend.is_none() { self.find_redraw(cx, p) } else { None };
+                // A path continued starts at its end, one redrawn on it; a new one where it snaps.
+                let start = if self.snaps() && self.extend.is_none() && self.redraw.is_none() { self.snap.press(cx, p, &[], None) } else { p };
                 self.clear();
                 self.push(start, ev.pressure);
                 vec![]
@@ -244,10 +279,15 @@ impl Tool for GestureTool {
                 self.began = false;
                 self.clear();
                 self.extend = None;
+                self.redraw = None;
                 out
             }
             _ => vec![],
         }
+    }
+    /// `[` and `]` are the Blob Brush's and the Eraser's: their size (#1661).
+    fn claims_key(&self, _cx: &ToolContext, key: ToolKey) -> bool {
+        matches!(key, ToolKey::BracketLeft | ToolKey::BracketRight) && matches!(self.id, "blobBrush" | "eraser")
     }
     fn key(&mut self, _cx: &ToolContext, key: ToolKey, _m: Mods) -> Vec<Action> {
         match key {
@@ -292,15 +332,31 @@ impl Tool for GestureTool {
         o
     }
     fn cursor(&self, _cx: &ToolContext, _p: Point, _m: Mods) -> Cursor {
-        Cursor::Crosshair
+        match self.id {
+            "paintbrush" => Cursor::Paintbrush,
+            "blobBrush" => Cursor::BlobBrush,
+            "eraser" => Cursor::Eraser,
+            "knife" => Cursor::Knife,
+            "smooth" => Cursor::Smooth,
+            "pathEraser" => Cursor::PathEraser,
+            "join" => Cursor::Join,
+            _ => Cursor::Pencil,
+        }
     }
     fn options(&self) -> Value {
         match self.id {
             "pencil" | "paintbrush" => {
-                json!({"fidelity": self.fidelity, "fill": self.fill, "editWithin": self.edit_within, "closeWithin": self.close_within})
+                json!({
+                    "fidelity": self.fidelity,
+                    "fill": self.fill,
+                    "keepSelected": self.keep_selected,
+                    "editWithin": self.edit_within,
+                    "closeWithin": self.close_within
+                })
             }
             "smooth" => json!({"fidelity": self.fidelity}),
-            "blobBrush" | "eraser" => json!({"size": self.size}),
+            "blobBrush" => json!({"size": self.size, "keepSelected": self.keep_selected, "mergeOnlySelection": self.merge_only_selection}),
+            "eraser" => json!({"size": self.size}),
             _ => Value::Null,
         }
     }
@@ -309,6 +365,8 @@ impl Tool for GestureTool {
             "fidelity" => self.fidelity = v.as_f64().unwrap_or(self.fidelity).clamp(0.05, 100.0),
             "size" => self.size = v.as_f64().unwrap_or(self.size).clamp(0.1, 1000.0),
             "fill" => self.fill = v.as_bool().unwrap_or(self.fill),
+            "keepSelected" => self.keep_selected = v.as_bool().unwrap_or(self.keep_selected),
+            "mergeOnlySelection" => self.merge_only_selection = v.as_bool().unwrap_or(self.merge_only_selection),
             "editWithin" => self.edit_within = v.as_f64().unwrap_or(self.edit_within).clamp(0.0, 100.0),
             "closeWithin" => self.close_within = v.as_f64().unwrap_or(self.close_within).clamp(0.0, 100.0),
             _ => {}
@@ -389,6 +447,49 @@ mod tests {
         assert!(matches!(&last[0], Action::Preview(_, v) if v["closed"] == false && v["style"] == "pencil"));
         assert_eq!(last[1], Action::Commit);
         assert!(!t.busy());
+    }
+
+    /// Keep selected is on by default, and every Pencil and Paintbrush preview sends it.
+    #[test]
+    fn pencil_and_paintbrush_send_keep_selected() {
+        let (d, _) = doc_with_rect();
+        let s = Selection::default();
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        for id in ["pencil", "paintbrush"] {
+            let mut t = GestureTool::new(id);
+            assert_eq!(t.options()["keepSelected"], json!(true), "{id}");
+            for keep in [true, false] {
+                t.set_option("keepSelected", &json!(keep));
+                assert_eq!(t.options()["keepSelected"], json!(keep), "{id}");
+                let acts = drag(&mut t, &cx, &[(0.0, 0.0), (10.0, 5.0), (20.0, 0.0)], Mods::default());
+                assert!(acts[1..].iter().all(|a| a.iter().all(|a| !matches!(a, Action::Preview(_, v) if v["keepSelected"] != keep))), "{id}");
+                assert!(matches!(&acts.last().unwrap()[0], Action::Preview(_, v) if v["keepSelected"] == keep), "{id}");
+            }
+        }
+    }
+
+    /// The Blob Brush has Keep selected and Merge only with selection, both off by default, and its
+    /// stroke sends both.
+    #[test]
+    fn blob_brush_sends_keep_selected_and_merge_only_with_selection() {
+        let (d, _) = doc_with_rect();
+        let s = Selection::default();
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let mut t = GestureTool::new("blobBrush");
+        assert_eq!((t.options()["keepSelected"].clone(), t.options()["mergeOnlySelection"].clone()), (json!(false), json!(false)));
+        for (keep, only) in [(false, false), (true, false), (false, true)] {
+            t.set_option("keepSelected", &json!(keep));
+            t.set_option("mergeOnlySelection", &json!(only));
+            let acts = drag(&mut t, &cx, &[(50.0, 150.0), (250.0, 150.0)], Mods::default());
+            assert!(
+                matches!(&acts[2][0], Action::Exec(c, v) if c == "path.blob" && v["keepSelected"] == keep && v["mergeOnlySelection"] == only),
+                "{acts:?}"
+            );
+        }
+        // The Eraser keeps Size only.
+        assert_eq!(GestureTool::new("eraser").options(), json!({"size": 10.0}));
     }
 
     #[test]

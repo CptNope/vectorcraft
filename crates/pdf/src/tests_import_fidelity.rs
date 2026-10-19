@@ -321,6 +321,23 @@ fn font_names_resolve_to_available_families() {
     assert_eq!((family.as_str(), style.as_str(), found), ("Missing Sans Pro", "Bold Italic", false));
 }
 
+/// A value of the page's font dictionary that the reader can't parse (a name with a broken `#`
+/// escape, a number with a stray `-`) is left out when the page's fonts are noted, and the fonts
+/// after it are noted.
+#[test]
+fn fonts_are_noted_past_font_resources_the_reader_cannot_parse() {
+    for junk in ["/#zz", "12-.5"] {
+        let resources = format!("/Font << /A {junk} /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >>");
+        let bytes = one_page("BT /F1 24 Tf 10 30 Td (Hello) Tj ET", &resources, &[]);
+        // Opened by the reader alone, without the checks of `pages::open`.
+        let pdf = craft_pdf::syntax::Pdf::new(bytes).unwrap();
+        let mut fonts = crate::import_scan::FontNames::new();
+        let mut ocgs = crate::import_scan::Ocgs::read(&pdf);
+        crate::import_scan::scan_page(&pdf.pages()[0], &mut ocgs, false, &mut fonts, pdf.decode_limits().max_decoded_stream()).unwrap();
+        assert_eq!(fonts.into_values().collect::<Vec<_>>(), [("Helvetica".to_string(), false)], "{junk}");
+    }
+}
+
 // ---------- meshes, stops and extend ----------
 
 fn hex(bytes: &[u8]) -> String {
@@ -403,6 +420,24 @@ fn a_shading_that_does_not_extend_paints_only_between_its_ends() {
     let d = open(&one_page("/Sh0 sh", &shading("true false"), &[]));
     let b = all(&d).into_iter().find(|n| matches!(n.kind, NodeKind::Group { clip: true, .. })).unwrap().geometric_bounds().unwrap();
     assert!(b.x0 <= 0.0 && (b.x1 - 80.0).abs() < 0.01, "{b:?}");
+}
+
+/// GUARDS: an exponential function with N off 1 (how a gradient midpoint is written) keeps its
+/// curve: sampled stops must follow it, not collapse to the two ends because neighbouring samples
+/// look straight.
+#[test]
+fn a_shading_with_an_exponent_keeps_its_curve() {
+    let shading = "/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] /Extend [true true] /Function << /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 1 1] /N 1.4234 >> >> >>";
+    let d = open(&one_page("/Sh0 sh", shading, &[]));
+    let g = all(&d)
+        .into_iter()
+        .find_map(|n| n.appearance.items.iter().find_map(|i| if let Paint::Gradient(g) = i.paint() { Some(g.clone()) } else { None }))
+        .expect("a gradient");
+    assert!(g.gradient.stops.len() > 2, "{:?}", g.gradient.stops);
+    // Halfway along, the curve is at 0.5^1.4234 ≈ 0.373, well off the straight 0.5.
+    let (c, _) = g.gradient.sample(0.5);
+    let v = c.to_rgb()[0];
+    assert!((v - 0.5f32.powf(1.4234)).abs() < 0.01, "{v}");
 }
 
 /// A diamond (10–90 × 10–90) clipping `paint`, which fills its bounds: how a shape filled with a
@@ -608,4 +643,17 @@ fn clips_with_the_page_as_bounding_box_still_clip() {
     assert!(clipped("50 0 m 100 50 l 50 100 l 0 50 l h"), "diamond");
     assert!(!clipped("0 0 100 100 re"), "the page");
     assert!(!clipped("50 -60 m 160 50 l 50 160 l -60 50 l h"), "a turned square around the page");
+}
+
+/// Issue #2674: `0 w` is the thinnest line the device can draw (ISO 32000-1, 8.4.3.2), not no
+/// line: it imports as a visible hairline and survives a PDF round trip.
+#[test]
+fn zero_width_lines_import_as_hairlines() {
+    let d = open(&one_page("0 0 0 RG 0 w 10 50 m 90 50 l S 0.9 g 0 w 20 60 30 20 re b 1 w 10 20 m 90 20 l S", "", &[]));
+    let widths = |d: &Document| -> Vec<f64> { all(d).iter().filter_map(|n| n.appearance.stroke().map(|s| s.width)).collect() };
+    let w = widths(&d);
+    assert_eq!(w.len(), 3, "{w:?}");
+    assert!(w.iter().all(|w| *w > 0.0 && *w <= 1.0), "zero width strokes become hairlines: {w:?}");
+    let back = widths(&roundtrip(&d));
+    assert_eq!(back.len(), 3, "hairlines survive the PDF round trip: {back:?}");
 }

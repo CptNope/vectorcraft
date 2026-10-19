@@ -7,6 +7,7 @@ This file uses only the Python standard library, including for its icons.
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import struct
 import sys
@@ -90,6 +91,10 @@ if ('serviceWorker' in navigator) {
             raise SystemExit("Missing </body> tag in Trunk output")
         html=html.replace("</body>",registration+"</body>",1)
     index.write_text(html,encoding="utf-8")
+    # Each release gets its own cache to avoid stale editor WASM on upgrades.
+    version=(os.getenv("GITHUB_SHA") or "local")[:12]
+    worker=(site/"sw.js")
+    worker.write_text(worker.read_text(encoding="utf-8").replace("__BUILD_VERSION__", version), encoding="utf-8")
     for name in ("index.html","manifest.webmanifest","sw.js",
                  "icons/icon-192.png","icons/icon-512.png"):
         if not (site/name).is_file():

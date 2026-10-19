@@ -45,25 +45,70 @@ impl View {
     }
 }
 
+/// The status bar's angle menu and View › Rotate View list these preset view angles, each as
+/// (label, degrees clockwise on screen).
+pub const ROTATE_VIEW_ANGLES: [(&str, f64); 12] = [
+    ("0°", 0.0),
+    ("15°", 15.0),
+    ("30°", 30.0),
+    ("45°", 45.0),
+    ("60°", 60.0),
+    ("90°", 90.0),
+    ("180°", 180.0),
+    ("-15°", -15.0),
+    ("-30°", -30.0),
+    ("-45°", -45.0),
+    ("-60°", -60.0),
+    ("-90°", -90.0),
+];
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Zoom stop stepping reads this (set each UI frame and before commands) so canvas wheel zoom
+/// matches the status bar when Display Print Size at 100% Zoom is on.
+static ZOOM_STOPS_PRINT_SIZE: AtomicBool = AtomicBool::new(false);
+
+pub fn sync_zoom_stops_display_print_size(v: bool) {
+    ZOOM_STOPS_PRINT_SIZE.store(v, Ordering::Relaxed);
+}
+
 /// Illustrator's preset zoom stops, in percent.
 pub const ZOOM_STOPS: [f64; 26] = [
     3.13, 4.17, 6.25, 8.33, 12.5, 16.67, 25.0, 33.33, 50.0, 66.67, 100.0, 150.0, 200.0, 300.0, 400.0, 600.0, 800.0, 1200.0, 1600.0, 2400.0, 3200.0,
     4800.0, 6400.0, 12800.0, 25600.0, 64000.0,
 ];
 
+/// Document zoom at 100% in the status bar: one screen point per document point, or with
+/// Preferences › General › Display Print Size at 100% Zoom, one document inch in 96 screen points.
+pub fn zoom_baseline(display_print_size: bool) -> f64 {
+    if display_print_size { 96.0 / 72.0 } else { 1.0 }
+}
+
+pub fn zoom_display_percent(z: f64, display_print_size: bool) -> f64 {
+    z / zoom_baseline(display_print_size) * 100.0
+}
+
+pub fn zoom_from_display_percent(pct: f64, display_print_size: bool) -> f64 {
+    pct / 100.0 * zoom_baseline(display_print_size)
+}
+
 pub fn next_zoom(z: f64, up: bool) -> f64 {
-    let pct = z * 100.0;
+    next_zoom_with_display(z, up, ZOOM_STOPS_PRINT_SIZE.load(Ordering::Relaxed))
+}
+
+pub fn next_zoom_with_display(z: f64, up: bool, display_print_size: bool) -> f64 {
+    let pct = zoom_display_percent(z, display_print_size);
     let stop = if up {
         ZOOM_STOPS.iter().find(|s| **s > pct + 0.01).copied().unwrap_or(64000.0)
     } else {
         ZOOM_STOPS.iter().rev().find(|s| **s < pct - 0.01).copied().unwrap_or(3.13)
     };
-    stop / 100.0
+    zoom_from_display_percent(stop, display_print_size)
 }
 
 /// Format like Illustrator's tab/zoom field: up to 2 decimals, no trailing zeros.
-pub fn zoom_label(z: f64) -> String {
-    let s = format!("{:.2}", z * 100.0);
+pub fn zoom_label(z: f64, display_print_size: bool) -> String {
+    let s = format!("{:.2}", zoom_display_percent(z, display_print_size));
     let s = s.trim_end_matches('0').trim_end_matches('.');
     format!("{s}%")
 }
@@ -117,6 +162,7 @@ pub const ICON_PANELS: &[(&str, &str, &str)] = &[
     ("transform", "Transform", "dc-transform-panel"),
     ("align", "Align", "dc-align"),
     ("pathfinder", "Pathfinder", "dc-pathfinder"),
+    (crate::panels::blend::ID, "Blend", "dc-blend"),
     ("character", "Character", "type"),
     ("paragraph", "Paragraph", "pilcrow"),
     ("glyphs", "Glyphs", "text-cursor-input"),
@@ -134,6 +180,7 @@ pub const ICON_PANELS: &[(&str, &str, &str)] = &[
     ("magicWand", "Magic Wand", "wand-sparkles"),
     (crate::panels::flattener_preview::ID, "Flattener Preview", "eye"),
     ("attributes", "Attributes", "settings"),
+    (crate::panels::svg_interactivity::ID, "SVG Interactivity", "spline-pointer"),
     ("colorThemes", "Color Themes", "sun"),
     (crate::panels::links::ID, "Links", "link"),
     (crate::panels::asset_export::ID, "Asset Export", "share-2"),
@@ -183,6 +230,9 @@ pub struct ViewFlags {
     pub gradient_annotator: bool,
     /// Type → Show Hidden Characters.
     pub hidden_chars: bool,
+    /// View → Hide/Show Template: template layers drawn (dimmed) or left out of the canvas.
+    #[serde(default = "yes")]
+    pub templates: bool,
 }
 
 impl Default for ViewFlags {
@@ -205,6 +255,7 @@ impl Default for ViewFlags {
             text_threads: true,
             gradient_annotator: true,
             hidden_chars: false,
+            templates: true,
         }
     }
 }
@@ -268,6 +319,11 @@ pub struct UiState {
     /// starts under the selection at every launch.
     #[serde(skip)]
     pub task_bar_place: TaskBarPlace,
+    /// The locked objects under the pointer at the last right-click on the canvas, with the
+    /// document's `uid`: the context menu's Unlock submenu lists them while the menu is open. Not
+    /// saved.
+    #[serde(skip)]
+    pub context_locked: Option<(u64, Vec<vectorcraft_doc::NodeId>)>,
     /// Last tool shown in each toolbar slot (keyed by the slot's first tool id).
     #[serde(default)]
     pub slot_tool: std::collections::BTreeMap<String, String>,
@@ -277,6 +333,10 @@ pub struct UiState {
     /// The Basic and Advanced toolbars as Edit Toolbar left them (none: as they ship).
     #[serde(default)]
     pub toolbar_edits: ToolbarEdits,
+    /// The controls under the toolbar's tools that the All Tools drawer's Show section shows
+    /// (`toolbar.show`).
+    #[serde(default)]
+    pub toolbar_show: ToolbarShow,
     /// Edit Toolbar's All Tools drawer is open beside the toolbar (`window.editToolbar`).
     #[serde(skip)]
     pub tools_drawer: bool,
@@ -294,14 +354,32 @@ pub struct UiState {
     /// Invalidates in-flight gestures when a workspace is replaced.
     #[serde(skip)]
     pub docking_generation: u64,
+    /// The main dock column's outer width in screen points (legacy or shared docking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dock_width: Option<f32>,
+    /// Next frame should seed egui [`PanelState`] from [`Self::dock_width`] (workspace switch).
+    #[serde(skip)]
+    pub dock_width_pending: bool,
     /// The Tools panel floats with its top-left corner here (dragged out by its title bar); `None`:
     /// docked at the window's left edge.
     #[serde(default)]
     pub toolbar_pos: Option<[f32; 2]>,
     pub status_bar: bool,
     pub dock: bool,
+    /// The bars that Tab (`window.dock`) hid, which the next Tab shows again; none when Tab has not
+    /// hidden them since it last showed them, or a workspace was applied since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_hid: Option<TabHid>,
     pub view: ViewFlags,
     pub dialog: Option<Dialog>,
+    /// Messages to show in a dialog once the open one is closed (`dialogs::confirm::tell`), in
+    /// the order they came.
+    #[serde(skip)]
+    pub told: Vec<Dialog>,
+    /// A control request is being answered: its caller gets what fails as its reply, so no
+    /// dialog says it too (`io::report_write_error`).
+    #[serde(skip)]
+    pub answering_control: bool,
     /// Toolbar group whose flyout is open.
     pub flyout: Option<usize>,
     /// Last tool shown for each toolbar group (flyout selection sticks).
@@ -350,9 +428,11 @@ pub struct UiState {
     /// Color Guide panel: variation kind, steps and amount (Color Guide Options).
     #[serde(default)]
     pub color_guide: vectorcraft_color::harmony::GuideOptions,
-    /// The library open in the library panel (Window → Swatch Libraries).
+    /// The library panels' settings (Window → Swatch Libraries, Graphic Style Libraries): of each
+    /// library opened, and of the persistent ones, which reopen at startup, also once closed
+    /// ([`crate::panels::library_panel`], `ui.libraryPanel`).
     #[serde(default)]
-    pub library_panel: Option<crate::panels::library_panel::OpenLibrary>,
+    pub library_panels: Vec<crate::panels::library_panel::LibraryPanel>,
     /// Flattener Preview panel: highlight, overprints, preset and options (`ui.flattenerPreview`).
     #[serde(default)]
     pub flattener_preview: crate::panels::flattener_preview::Settings,
@@ -364,6 +444,14 @@ pub struct UiState {
     /// buttons follow ([`crate::panels::align::with_align_to`]).
     #[serde(default, deserialize_with = "crate::panels::align::deserialize_align_to")]
     pub align_to: crate::panels::align::AlignTo,
+    /// Color panel: the mode picked last from its menu (`None`: never picked), in which the panel
+    /// shows the defaults for new art ([`crate::panels::color::deserialize_mode`]).
+    #[serde(default, deserialize_with = "crate::panels::color::deserialize_mode")]
+    pub color_mode: Option<crate::panels::color::Mode>,
+    /// Color panel: Hide Options, which leaves just the proxy and the spectrum (`ui.colorPanel`,
+    /// [`crate::panels::color::deserialize_hide_options`]).
+    #[serde(default, deserialize_with = "crate::panels::color::deserialize_hide_options")]
+    pub color_hide_options: bool,
     /// The SVG Options chosen last (`svg` object of the export/save commands; null: never used).
     #[serde(default)]
     pub svg_options: Value,
@@ -400,6 +488,10 @@ pub struct UiState {
     /// dialog opens on them (#1152).
     #[serde(default)]
     pub offset_path: Value,
+    /// The Move dialog's checkboxes as it was last confirmed with (copy, objects, preview; null:
+    /// never used): it opens with them.
+    #[serde(default)]
+    pub move_options: Value,
     /// The DXF Import Options chosen last (fit, scaleLineweights, center, mergeLayers; null:
     /// never used).
     #[serde(default)]
@@ -412,9 +504,17 @@ pub struct UiState {
     /// Layers panel › Panel Options… (row size, thumbnails, Show Layers Only).
     #[serde(default)]
     pub layers_panel: crate::panels::layers::PanelOptions,
+    /// The Layers panel's Filter (`ui.layersFilter`). It is not saved and lasts the session, as the
+    /// Search All text does.
+    #[serde(skip)]
+    pub layers_filter: crate::panels::layers::Filter,
     /// The Image Trace panel's Advanced section is open (as it was last left).
     #[serde(default = "yes")]
     pub image_trace_advanced: bool,
+    /// Glyphs panel preview step, kept with the other panel choices. `0` is the default 30 pt
+    /// cell; `1`..=`7` is a step from smallest to largest (`crates/ui-egui/src/panels/glyphs.rs`).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub glyphs_preview: u8,
     /// The desktop window's size, position and maximized state, saved when the app quits and
     /// restored at the next launch (the desktop host reads and writes it; none on the web).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -454,6 +554,57 @@ pub struct ToolbarCategory {
     pub slots: Vec<Vec<String>>,
 }
 
+/// The controls under the toolbar's tools, each shown or hidden from the All Tools drawer's Show
+/// section: Fill and Stroke (the proxy), Coloring (Color, Gradient, None), Draw Mode and Screen
+/// Mode. All shown as it ships.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolbarShow {
+    #[serde(default = "yes")]
+    pub fill_stroke: bool,
+    #[serde(default = "yes")]
+    pub coloring: bool,
+    #[serde(default = "yes")]
+    pub draw_mode: bool,
+    #[serde(default = "yes")]
+    pub screen_mode: bool,
+}
+
+impl Default for ToolbarShow {
+    fn default() -> Self {
+        Self { fill_stroke: true, coloring: true, draw_mode: true, screen_mode: true }
+    }
+}
+
+impl ToolbarShow {
+    /// The controls as (`toolbar.show` name, label, icon), in the Show section's order.
+    pub const CONTROLS: [(&'static str, &'static str, &'static str); 4] = [
+        ("fillStroke", "Fill and Stroke Controls", "dc-stroke"),
+        ("coloring", "Coloring Controls", "dc-gradient"),
+        ("drawMode", "Draw Mode Controls", "dc-draw-normal"),
+        ("screenMode", "Screen Mode Controls", "dc-screen-mode"),
+    ];
+
+    /// The flag of the control named `name`.
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut bool> {
+        match name {
+            "fillStroke" => Some(&mut self.fill_stroke),
+            "coloring" => Some(&mut self.coloring),
+            "drawMode" => Some(&mut self.draw_mode),
+            "screenMode" => Some(&mut self.screen_mode),
+            _ => None,
+        }
+    }
+
+    pub fn get(self, name: &str) -> bool {
+        let mut s = self;
+        s.get_mut(name).is_some_and(|on| *on)
+    }
+
+    pub fn json(self) -> serde_json::Value {
+        serde_json::json!({"fillStroke": self.fill_stroke, "coloring": self.coloring, "drawMode": self.draw_mode, "screenMode": self.screen_mode})
+    }
+}
+
 /// The toolbars Edit Toolbar changed: each one is `None` while it is as it ships.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolbarEdits {
@@ -479,6 +630,15 @@ pub struct TaskBarPlace {
     /// it follows the selection, and the document (`DocState::uid`) it was moved in: in another
     /// document the bar starts under the selection again.
     pub offset: Option<(u64, egui::Vec2)>,
+}
+
+/// Which of the panels, the toolbar and the Control bar showed when Tab (`window.dock`) hid them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TabHid {
+    pub dock: bool,
+    pub toolbar: bool,
+    pub control_bar: bool,
 }
 
 /// A group of panels dragged out of the dock: it floats as a stack of tabs, one panel shown.
@@ -518,7 +678,7 @@ impl FloatingPanels {
     pub fn sanitize(groups: &mut Vec<FloatingPanels>, toolbar_pos: &mut Option<[f32; 2]>) {
         let mut seen = std::collections::BTreeSet::new();
         groups.retain_mut(|g| {
-            g.panels.retain(|id| all_panels().any(|(p, _)| p == id) && seen.insert(id.clone()));
+            g.panels.retain(|id| crate::menus::normalize_panel(id) == Some(id.as_str()) && seen.insert(id.clone()));
             g.active = g.active.min(g.panels.len().saturating_sub(1));
             !g.panels.is_empty()
         });
@@ -607,20 +767,27 @@ impl Default for UiState {
             toolbar_advanced: false,
             task_bar: true,
             task_bar_place: TaskBarPlace::default(),
+            context_locked: None,
             slot_tool: Default::default(),
             floating_flyouts: vec![],
             toolbar_edits: ToolbarEdits::default(),
+            toolbar_show: ToolbarShow::default(),
             tools_drawer: false,
             floating_panels: vec![],
             docking: None,
             docking_hidden: Default::default(),
             docking_icons: Default::default(),
             docking_generation: 0,
+            dock_width: None,
+            dock_width_pending: false,
             toolbar_pos: None,
             status_bar: true,
             dock: true,
+            tab_hid: None,
             view: ViewFlags::default(),
             dialog: None,
+            told: vec![],
+            answering_control: false,
             flyout: None,
             group_tool: vectorcraft_tools::TOOL_GROUPS.iter().map(|g| g[0].id.to_string()).collect(),
             status: String::new(),
@@ -640,10 +807,12 @@ impl Default for UiState {
             favorite_fonts: vec![],
             engine_prefs: Value::Null,
             color_guide: Default::default(),
-            library_panel: None,
+            library_panels: vec![],
             flattener_preview: Default::default(),
             color_guide_limit: String::new(),
             align_to: Default::default(),
+            color_mode: None,
+            color_hide_options: false,
             svg_options: Value::Null,
             place_link: true,
             dialog_file: None,
@@ -654,10 +823,13 @@ impl Default for UiState {
             dxf_options: Value::Null,
             eps_options: Value::Null,
             offset_path: Value::Null,
+            move_options: Value::Null,
             dxf_import: Value::Null,
             home: None,
             layers_panel: Default::default(),
+            layers_filter: Default::default(),
             image_trace_advanced: true,
+            glyphs_preview: 0,
             window: None,
         }
     }
@@ -665,6 +837,10 @@ impl Default for UiState {
 
 fn yes() -> bool {
     true
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 fn default_shortcut_set() -> String {
@@ -681,12 +857,22 @@ mod tests {
 
     #[test]
     fn zoom_steps() {
-        assert_eq!(next_zoom(1.0, true), 1.5);
-        assert!((next_zoom(1.0, false) - 0.6667).abs() < 1e-9);
-        assert_eq!(next_zoom(640.0, true), 640.0);
-        assert_eq!(zoom_label(0.6667), "66.67%");
-        assert_eq!(zoom_label(1.0), "100%");
-        assert_eq!(zoom_label(0.125), "12.5%");
+        assert_eq!(next_zoom_with_display(1.0, true, false), 1.5);
+        assert!((next_zoom_with_display(1.0, false, false) - 0.6667).abs() < 1e-9);
+        assert_eq!(next_zoom_with_display(640.0, true, false), 640.0);
+        assert_eq!(zoom_label(0.6667, false), "66.67%");
+        assert_eq!(zoom_label(1.0, false), "100%");
+        assert_eq!(zoom_label(0.125, false), "12.5%");
+    }
+
+    /// storytold/vectorcraft#2719: 100% in the zoom field matches Actual Size when Display Print Size is on.
+    #[test]
+    fn zoom_percent_honors_display_print_size_baseline() {
+        let b = zoom_baseline(true);
+        assert!((zoom_from_display_percent(100.0, true) - b).abs() < 1e-12);
+        assert_eq!(zoom_from_display_percent(100.0, false), 1.0);
+        assert_eq!(zoom_label(b, true), "100%");
+        assert_eq!(next_zoom_with_display(b, true, true), zoom_from_display_percent(150.0, true));
     }
 
     #[test]

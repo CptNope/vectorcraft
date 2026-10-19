@@ -730,19 +730,35 @@ impl GradientMesh {
             .to_point()
     }
 
-    /// Bilinear colour and opacity of patch (r, c) at local (u, v).
+    /// Bilinear colour and opacity of patch (r, c) at local (u, v). Corners all in CMYK (or all
+    /// grey) mix in that space, as a PDF shading mixes in its own colour space: the inks come out
+    /// exact, and a CMYK document separates no colour to draw them. Other corners mix in RGB.
     pub fn color_at(&self, r: usize, c: usize, u: f64, v: f64) -> (Color, f32) {
         let q =
             [&self.points[self.idx(r, c)], &self.points[self.idx(r, c + 1)], &self.points[self.idx(r + 1, c)], &self.points[self.idx(r + 1, c + 1)]];
         let w = [(1.0 - u) * (1.0 - v), u * (1.0 - v), (1.0 - u) * v, u * v];
-        let mut rgb = [0.0f32; 3];
-        let mut op = 0.0f32;
-        for k in 0..4 {
-            let c = q[k].color.to_rgb();
-            for (ch, x) in rgb.iter_mut().zip(c) {
-                *ch += x * w[k] as f32;
+        let op = q.iter().zip(w).map(|(p, w)| p.opacity * w as f32).sum();
+        let cmyk: Option<Vec<[f32; 4]>> =
+            q.iter().map(|p| if let Color::Cmyk { c, m, y, k } = p.color { Some([c, m, y, k]) } else { None }).collect();
+        if let Some(inks) = cmyk {
+            let mut mix = [0.0f32; 4];
+            for (ink, w) in inks.iter().zip(w) {
+                for (m, x) in mix.iter_mut().zip(ink) {
+                    *m += x * w as f32;
+                }
             }
-            op += q[k].opacity * w[k] as f32;
+            let [c, m, y, k] = mix;
+            return (Color::Cmyk { c, m, y, k }, op);
+        }
+        let grey: Option<Vec<f32>> = q.iter().map(|p| if let Color::Gray { k } = p.color { Some(k) } else { None }).collect();
+        if let Some(ks) = grey {
+            return (Color::Gray { k: ks.iter().zip(w).map(|(k, w)| k * w as f32).sum() }, op);
+        }
+        let mut rgb = [0.0f32; 3];
+        for (p, w) in q.iter().zip(w) {
+            for (ch, x) in rgb.iter_mut().zip(p.color.to_rgb()) {
+                *ch += x * w as f32;
+            }
         }
         (Color::rgb(rgb[0], rgb[1], rgb[2]), op)
     }
@@ -1437,7 +1453,7 @@ fn map_node(n: &Node, w: &Warper) -> Node {
             }
         }
         NodeKind::Mesh(m) => m.map(w.f),
-        NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Repeat(_) => {
+        NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Repeat(_) | NodeKind::Intertwine { .. } => {
             if let Some(d) = &deeper {
                 return map_node(&expanded_group_hooks(n, w.hooks), d);
             }
@@ -1616,7 +1632,15 @@ pub fn envelope_bounds(content: &[Arc<Node>], kind: &EnvelopeKind, frame: Affine
 
 /// Is this one of the live kinds?
 pub fn is_live(n: &Node) -> bool {
-    matches!(n.kind, NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) | NodeKind::PlacedDocument(_))
+    matches!(
+        n.kind,
+        NodeKind::Blend { .. }
+            | NodeKind::Envelope { .. }
+            | NodeKind::Mesh(_)
+            | NodeKind::Repeat(_)
+            | NodeKind::PlacedDocument(_)
+            | NodeKind::Intertwine { .. }
+    )
 }
 
 /// Mesh tessellation as filled quad paths (no stroke), `n`×`n` per patch.
@@ -1651,6 +1675,7 @@ pub fn expand_live_hooks(n: &Node, hooks: Hooks) -> Vec<Node> {
         NodeKind::Mesh(m) => mesh_quad_nodes(m, 8),
         NodeKind::Repeat(r) => r.expand(),
         NodeKind::PlacedDocument(p) => p.art(n),
+        NodeKind::Intertwine { children } => crate::intertwine::expand(children),
         _ => vec![n.clone()],
     }
 }
@@ -1705,11 +1730,23 @@ pub fn subtree_has_live(n: &Node) -> bool {
     any
 }
 
-/// Largest stroke outset in a subtree (for visual bounds of envelopes).
-pub(crate) fn max_outset(nodes: &[Arc<Node>]) -> f64 {
+/// Largest stroke outset in a subtree (for visual bounds of envelopes). With `symbols`, the
+/// outsets in the art of the symbols its instances show count too
+/// ([`crate::symbols::ArtBox::reach`]), grown by [`crate::SymbolBoxes::brush_pad`]. In boxes made
+/// by [`crate::SymbolBoxes::without_art_strokes`], the outsets in the art do not count, and the pad
+/// does.
+pub(crate) fn max_outset(nodes: &[Arc<Node>], symbols: Option<&crate::SymbolBoxes>) -> f64 {
     let mut o = 0.0f64;
     for n in nodes {
-        n.walk(&mut |c| o = o.max(c.appearance.outset()));
+        n.walk(&mut |c| {
+            o = o.max(c.appearance.outset());
+            if let (Some(s), NodeKind::SymbolInstance { symbol, .. }) = (symbols, &c.kind)
+                && let Some(art) = s.art(symbol)
+            {
+                let reach = if s.art_strokes() { art.reach } else { 0.0 };
+                o = o.max(reach + s.brush_pad(symbol));
+            }
+        });
     }
     o
 }
@@ -1801,5 +1838,20 @@ mod tests {
         assert!(m.points[i].p.distance(Point::new(30.0, 60.0)) < 0.5, "{:?}", m.points[i].p);
         assert!(m.remove_point_lines(i));
         assert_eq!((m.rows, m.cols), (1, 1));
+    }
+
+    /// Corners all in CMYK mix in CMYK (the inks halfway), not in RGB.
+    #[test]
+    fn a_cmyk_mesh_mixes_its_inks() {
+        let cyan = Color::Cmyk { c: 1.0, m: 0.0, y: 0.0, k: 0.0 };
+        let mut m = GradientMesh::for_path(&shapes::rectangle(Rect::new(0.0, 0.0, 100.0, 100.0)), 1, 1, cyan, MeshAppearance::Flat, 0.0).unwrap();
+        m.points[0].color = Color::Cmyk { c: 0.0, m: 0.0, y: 0.0, k: 1.0 };
+        let (c, op) = m.color_at(0, 0, 0.0, 0.0);
+        assert_eq!((c, op), (Color::Cmyk { c: 0.0, m: 0.0, y: 0.0, k: 1.0 }, 1.0));
+        let Color::Cmyk { c, k, .. } = m.color_at(0, 0, 0.5, 0.5).0 else { panic!("mixed out of CMYK") };
+        assert!((c - 0.75).abs() < 1e-6 && (k - 0.25).abs() < 1e-6, "{c} {k}");
+        // A corner in another space mixes them all in RGB.
+        m.points[1].color = Color::rgb(1.0, 0.0, 0.0);
+        assert!(matches!(m.color_at(0, 0, 0.5, 0.5).0, Color::Rgb { .. }));
     }
 }

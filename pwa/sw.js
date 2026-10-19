@@ -1,7 +1,7 @@
 /* VectorCraft community PWA service worker.
    Installs an offline shell and caches successfully loaded WASM/JS/fonts.
    Keeps requests scoped to the deployed GitHub Pages project. */
-const CACHE = "vectorcraft-pwa-2026-10-v1";
+const CACHE = "vectorcraft-pwa-__BUILD_VERSION__";
 const CORE = ["./", "./index.html", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png"];
 
 self.addEventListener("install", event => {

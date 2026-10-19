@@ -3,7 +3,6 @@ name: Affinity 3 corpus
 on:
   workflow_dispatch:
 
-
 permissions:
   contents: read
 

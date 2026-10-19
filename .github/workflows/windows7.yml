@@ -8,7 +8,6 @@ name: Windows 7 x64 compatibility
 on:
   workflow_dispatch:
 
-
 permissions:
   contents: read
 
