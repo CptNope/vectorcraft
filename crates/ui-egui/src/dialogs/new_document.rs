@@ -297,7 +297,8 @@ fn show_mobile(app: &mut VectorcraftApp, ctx: &egui::Context) {
                     ui.add_space(8.0);
                     ui.label(tl!("Bleed"));
                     let bleed_field = ((width - 120.0) / 4.0).clamp(35.0, 58.0);
-                    form::bleed(ui, &mut d, unit(&d), bleed_field);
+                    let bleed_units = unit(&d);
+                    form::bleed(ui, &mut d, bleed_units, bleed_field);
                     ui.add_space(8.0);
 
                     let mut advanced_open = d.bool("advanced");
